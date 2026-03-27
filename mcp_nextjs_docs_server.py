@@ -62,11 +62,13 @@ class IndexedDoc:
     rel: str
     uri: str
     mime_type: str
+    raw_text: str
     text: str
     text_lower: str
     size_bytes: int
     mtime_ns: int
     digest: str
+    source_rel: Optional[str]
 
 
 _DOC_PATHS_CACHE: Optional[List[Path]] = None
@@ -121,6 +123,28 @@ def _is_text_file(path: Path) -> bool:
 
 def _should_skip_path(path: Path) -> bool:
     return any(part in IGNORED_DIR_NAMES for part in path.parts)
+
+
+def _matches_pattern(rel: str, pattern: str) -> bool:
+    pattern = pattern.strip()
+    if not pattern:
+        return True
+    if fnmatch(rel, pattern):
+        return True
+
+    normalized = pattern.rstrip("/")
+    if not any(ch in normalized for ch in "*?[]"):
+        return rel == normalized or rel.startswith(normalized + "/")
+
+    if normalized.endswith("/**/*"):
+        base = normalized[: -len("/**/*")]
+        return rel.startswith(base + "/")
+
+    if normalized.endswith("/**"):
+        base = normalized[: -len("/**")]
+        return rel.startswith(base + "/")
+
+    return False
 
 
 def _to_doc_uri(path: Path) -> str:
@@ -184,6 +208,71 @@ def _compute_digest(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _strip_order_prefix(part: str) -> str:
+    return re.sub(r"^\d+-", "", part)
+
+
+def _route_key_for_rel(rel: str) -> str:
+    path = Path(rel)
+    parts = list(path.parts)
+    if not parts:
+        return ""
+
+    normalized: List[str] = []
+    for part in parts[:-1]:
+        normalized.append(_strip_order_prefix(part))
+
+    stem = path.stem
+    if stem != "index":
+        normalized.append(_strip_order_prefix(stem))
+
+    return "/".join(normalized)
+
+
+def _extract_frontmatter_source(text: str) -> Optional[str]:
+    if not text.startswith("---\n"):
+        return None
+
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return None
+
+    frontmatter = text[4:end]
+    match = re.search(r"(?m)^source:\s*([^\n]+)\s*$", frontmatter)
+    if not match:
+        return None
+    return match.group(1).strip().strip("'\"")
+
+
+def _find_path_by_route_key(route_key: str) -> Optional[Path]:
+    for path in _all_knowledge_files():
+        rel = path.relative_to(ROOT).as_posix()
+        if _route_key_for_rel(rel) == route_key:
+            return path
+    return None
+
+
+def _resolve_doc_text(path: Path, raw_text: str, visited: Optional[set[str]] = None) -> Tuple[str, Optional[str]]:
+    rel = path.relative_to(ROOT).as_posix()
+    visited = visited or set()
+    if rel in visited:
+        return raw_text, None
+
+    visited.add(rel)
+    source_slug = _extract_frontmatter_source(raw_text)
+    if not source_slug:
+        return raw_text, None
+
+    source_path = _find_path_by_route_key(source_slug)
+    if source_path is None:
+        return raw_text, None
+
+    source_rel = source_path.relative_to(ROOT).as_posix()
+    source_raw = _read_text(source_path)
+    resolved_text, nested_source_rel = _resolve_doc_text(source_path, source_raw, visited)
+    return resolved_text, nested_source_rel or source_rel
+
+
 def _index_doc(path: Path) -> Optional[IndexedDoc]:
     try:
         stat = path.stat()
@@ -199,17 +288,20 @@ def _index_doc(path: Path) -> Optional[IndexedDoc]:
     if cached and cached.mtime_ns == int(stat.st_mtime_ns) and cached.size_bytes == size_bytes:
         return cached
 
-    text = _read_text(path)
+    raw_text = _read_text(path)
+    text, source_rel = _resolve_doc_text(path, raw_text)
     doc = IndexedDoc(
         path=path,
         rel=rel,
         uri=_to_doc_uri(path),
         mime_type=_mime_for(path),
+        raw_text=raw_text,
         text=text,
         text_lower=text.lower(),
         size_bytes=size_bytes,
         mtime_ns=int(stat.st_mtime_ns),
         digest=_compute_digest(text),
+        source_rel=source_rel,
     )
     _DOCS_INDEX[rel] = doc
     return doc
@@ -232,11 +324,11 @@ def _safe_snippet(text: str, idx: int, qlen: int, radius: int = 120) -> str:
     else:
         start = max(0, idx - radius)
         end = min(len(text), idx + qlen + radius)
+        while start > 0 and not text[start - 1].isspace():
+            start -= 1
+        while end < len(text) and not text[end - 1].isspace():
+            end += 1
         snippet = text[start:end].strip()
-        if start > 0:
-            snippet = "..." + snippet
-        if end < len(text):
-            snippet = snippet + "..."
     return re.sub(r"\s+", " ", snippet)
 
 
@@ -485,7 +577,7 @@ def _tool_list_docs(arguments: Dict[str, Any]) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     for path in _all_knowledge_files():
         rel = path.relative_to(ROOT).as_posix()
-        if pattern and not fnmatch(rel, pattern):
+        if not _matches_pattern(rel, pattern):
             continue
         items.append({"path": rel, "uri": _to_doc_uri(path)})
 
@@ -623,12 +715,15 @@ def _tool_read_doc(arguments: Dict[str, Any]) -> Dict[str, Any]:
     offset = max(0, offset)
     length = max(1, min(MAX_READ_CHUNK, length))
 
-    text = _read_text(candidate)
+    raw_text = _read_text(candidate)
+    text, source_rel = _resolve_doc_text(candidate, raw_text)
     total_chars = len(text)
     content = text[offset : offset + length]
     payload = {
         "path": candidate.relative_to(ROOT).as_posix(),
         "uri": _to_doc_uri(candidate),
+        "resolvedFromSource": bool(source_rel),
+        "sourcePath": source_rel,
         "totalChars": total_chars,
         "offset": offset,
         "length": length,

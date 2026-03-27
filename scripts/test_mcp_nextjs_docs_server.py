@@ -56,6 +56,12 @@ def main() -> int:
         assert listed["total"] > 0
         assert listed["results"]
 
+        architecture = unpack_text_tool_response(send(proc, 40, "tools/call", {"name": "list_docs", "arguments": {"pattern": "03-architecture/**/*", "limit": 5}}))
+        assert architecture["total"] > 0
+
+        community = unpack_text_tool_response(send(proc, 41, "tools/call", {"name": "list_docs", "arguments": {"pattern": "04-community/**/*", "limit": 5}}))
+        assert community["total"] > 0
+
         search = unpack_text_tool_response(
             send(
                 proc,
@@ -75,6 +81,7 @@ def main() -> int:
         )
         assert search["total"] > 0
         assert any(result["path"].endswith("01-app/02-guides/mcp.mdx") for result in search["results"])
+        assert all("..." not in result["snippet"] for result in search["results"])
 
         read = unpack_text_tool_response(
             send(
@@ -86,6 +93,19 @@ def main() -> int:
         )
         assert read["path"] == "01-app/02-guides/mcp.mdx"
         assert "mcp" in read["content"].lower()
+
+        shared = unpack_text_tool_response(
+            send(
+                proc,
+                60,
+                "tools/call",
+                {"name": "read_doc", "arguments": {"path": "02-pages/02-guides/authentication.mdx", "length": 5000}},
+            )
+        )
+        assert shared["resolvedFromSource"] is True
+        assert shared["sourcePath"] == "01-app/02-guides/authentication.mdx"
+        assert "understanding authentication is crucial" in shared["content"].lower()
+        assert shared["totalChars"] > 602
 
         resources = send(proc, 7, "resources/list")
         assert resources["result"]["resources"]
